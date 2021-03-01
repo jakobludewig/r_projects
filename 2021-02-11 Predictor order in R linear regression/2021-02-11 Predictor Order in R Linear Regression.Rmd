@@ -1,0 +1,583 @@
+---
+title: 'Does Predictor Order Affect the Results of Linear Regression: Simulation Study'
+output:
+  pdf_document: default
+  html_document:
+    df_print: default
+---
+
+This R notebook provides the details and replicable code for the simulation study
+presented in [this blog post](https://natural-blogarithm.com/post/r-regression-predictor-order/)
+about the effect on the coefficients when playing around with the input order of 
+your predictors in R's linear regression.
+
+# Environment Setup
+
+We are using `renv` to manage the environment.
+
+```{r setup, message=FALSE}
+source("renv/activate.R")
+library(tidyverse)
+library(magrittr)
+library(farff)
+library(gtools)
+library(OpenML)
+library(glue)
+library(fastDummies)
+theme_set(theme_light())
+```
+
+# Getting Datasets from OpenML
+
+We are using [OpenML's dataset repository](https://www.openml.org/search?type=data) 
+for this study. The dataset repository is queried with the following parameters.
+
+```{r parameters, message=FALSE}
+num_obs_min <- 
+  25
+num_obs_max <-
+  1000
+num_features_min <-
+  3
+num_features_max <-
+  59
+num_missing_values <-
+  0
+num_classes <- 0 # OpenML's way to identify datasets with numeric target variable
+```
+
+These choices are obviously quite subjective and could be debated. For example,
+we can not rule out a potential relationship between the number of predictors
+and the our issue of interest (fluctuations in coefficients under predictor 
+permutations). However, this study is not designed to be "representative"
+of the overall population of datasets but is meant to provide us with a number
+of educational example cases along which we can analyse the issue from a more
+theoretical perspective.
+
+```{r downloading_datasets, message=FALSE}
+oml_datasets <-
+  listOMLDataSets(
+    number.of.instances = c(num_obs_min,
+                            num_obs_max),
+    number.of.features = c(num_features_min,
+                           num_features_max),
+    number.of.missing.values = num_missing_values
+  ) %>%
+  filter(number.of.classes == num_classes,
+         format == "ARFF") # exclude sparse format which seems to cause problems
+
+datasets_raw <-
+  lapply(oml_datasets$data.id,
+         getOMLDataSet)
+
+names(datasets_raw) <-
+  as.character(oml_datasets$data.id)
+
+print(glue("Downloaded {length(datasets_raw)} datasets from OpenML repository."))
+```
+
+# Preprocessing
+
+We will apply some minimal pre-processing to the data. Most importantly we
+dummify the categorical variables. While the `lm` function can handle categorical 
+variables directly, this way will give us more control over the actual predictor
+ordering.
+
+```{r preprocessing, message=FALSE}
+preprocess_oml_dataset <-
+  function(dataset) {
+    if (any(!is.na(dataset$desc$ignore.attribute))) {
+      dataset$data %<>%
+        select(-dataset$desc$ignore.attribute)
+    }
+    
+    if (any(sapply(dataset$data, class) %in% c("factor", "character"))) {
+      dataset$data <-
+        dummy_cols(
+          dataset$data,
+          remove_selected_columns = T,
+          remove_first_dummy = T
+        )
+    }
+    
+    return(
+      dataset$data %>% nest(data = everything()) %>%
+        mutate(
+          dataset_id = dataset$desc$id,
+          dep_var = dataset$desc$default.target.attribute,
+          n_obs = nrow(dataset$data),
+          n_cols = ncol(dataset$data)
+        )
+    )
+  }
+
+datasets_processed <-
+  lapply(datasets_raw,
+         FUN = preprocess_oml_dataset)
+```
+
+# Create Datasets with Permuted Predictors
+
+For our simulation we will run several models on the same dataset with different
+input orders for the predictors. Since it will become computationally unfeasible
+(and also probably unnecessary for our purposes) to run through all permutations
+we are limiting the number of permutations per dataset to 20.
+
+Actually calculating all permutations and then choosing a subset of 20 from
+those permutations is also not computationally feasible for some of the number
+of predictors in the dataset. Therefore we are generating 200 permutations by
+randomly sampling the column indices and then choosing a subsample of up to 20 
+from the results.
+
+```{r creating_permutations, message=FALSE}
+generate_predictor_permutations <-
+  function(data,
+           dep_var_name,
+           perms_to_keep =  20,
+           perms_to_generate = 200) {
+    dep_var_col <-
+      which(names(data) == dep_var_name)
+    
+    pred_cols <-
+      setdiff(1:ncol(data),
+              dep_var_col)
+    perms <-
+      unique(replicate(
+        perms_to_generate,
+        sample(pred_cols,
+               size = length(pred_cols),
+               replace = F),
+        simplify = F
+      ))
+    perms <-
+      perms[1:min(length(perms), perms_to_keep)]
+    
+    perms <-
+      lapply(perms,
+             function(x)
+               c(dep_var_col, x))
+    
+    return(perms)
+  }
+```
+
+With the number of datasets and permutations we can actually generate all the
+permuted datasets and keep them in memory (as opposed to permuting the inputs
+on the fly right before the fitting of the model).
+
+In order to be able to consistently work with `dplyr` pipes we will put the
+resulting datasets in a nested dataframe instead of keeping the list structure.
+
+```{r creating_permutations2, message=FALSE}
+set.seed(41125)
+datasets_simulation <-
+  datasets_processed %>%
+  bind_rows() %>%
+  rowwise() %>%
+  mutate(predictor_permutations = list(generate_predictor_permutations(data,
+                                                                       dep_var))) %>%
+  unnest(predictor_permutations) %>%
+  mutate(simulation_id = row_number()) %>%
+  rowwise() %>%
+  mutate(data = data %>%
+           select(all_of(predictor_permutations)) %>%
+           list) %>%
+  select(simulation_id,
+         dataset_id,
+         dep_var,
+         data)
+print(glue("Generated {nrow(datasets_simulation)} datasets for simulation."))
+
+```
+# Fitting the Models
+
+With the nested dataframe structure fitting the models can be done easily with 
+a `rowwise` and `mutate` statement.
+
+```{r fitting_models}
+results_lm <-
+  datasets_simulation %>%
+  rowwise() %>%
+  mutate(model_fit = list(lm(
+    formula = as.formula(paste0(dep_var, " ~ .")),
+    data = data
+  ))) %>%
+  select(simulation_id,
+         dataset_id,
+         model_fit) %>%
+  ungroup()
+
+``` 
+
+We extract the coefficients from the models and put them in a for analysis.
+
+```{r extract_coefficients}
+coefficients_fit <-
+  results_lm %>%
+  rowwise() %>%
+  mutate(coefficients = list(bind_rows(coefficients(model_fit)) %>%
+                               gather(key, value))) %>%
+  select(-model_fit) %>%
+  ungroup() %>%
+  unnest(cols = coefficients)
+print(glue("Generated {nrow(coefficients_fit)} fits for {nrow(coefficients_fit %>% distinct(dataset_id,key))} different coefficients."))
+coefficients_fit %>% head
+``` 
+
+# Measuring Coefficient Fluctuations
+
+To analyse the fluctuations in the coefficients we will calculate the coefficient
+of variation (CV) for each of the fit coefficient.
+
+```{r analysis1}
+coefficients_summary <-
+  coefficients_fit %>%
+  group_by(dataset_id, key) %>%
+  summarise(total_coefficients_fit = n(),
+            total_missing = sum(is.na(value)),
+            cv = sd(value,na.rm = T)/abs(mean(value,na.rm=T)),
+            .groups = "drop")
+coefficients_summary
+
+``` 
+
+We define a threshold for the CV of $10^{-10}$ above which we flag the fluctuations 
+of the coefficient as too high. This threshold is somewhat arbitrary but it should 
+limit the maximum fluctuation of a given coefficient to $10^{-10} * \sqrt{N-1}$ 
+which should be acceptable for most practical applications. $N$ here is the number 
+of fits for the coefficient which in our case ranges between 2 and 20.
+
+```{r analysis2}
+cv_threshold <-
+  1e-10
+coefficients_summary %>% 
+  ggplot(aes(x = log10(cv))) + 
+  geom_histogram(binwidth = 1) +
+  geom_vline(xintercept = log10(cv_threshold),
+             color = "red", 
+             linetype ="dashed") +
+  ylab("Count of Coefficients") +
+  xlab("CV (Log 10 Scale)") +
+  ggtitle("Histogram of Coefficient of Variation for Fitted Coefficients", 
+          subtitle = paste0("Based on ", length(datasets_processed)," datasets, ",
+                            nrow(coefficients_summary), " coefficients"))
+```
+
+We can see that there is actually quite a substantial number of coefficients
+that fluctuate more than our allowed threshold. What is more we can see that
+some of the coefficients could not be fit (are missing):
+
+```{r analysis3}
+coefficients_summary %>%
+  summarise(
+    perc_coefficients_missing = sum(total_missing) / sum(total_coefficients_fit),
+    high_cv = mean(cv > cv_threshold, na.rm = T)
+  )
+```
+
+We will try to find out how the fluctuations come about by looking at the dataset
+level.
+
+# Analysing Problematic Datasets
+
+```{r problematic_datasets1, warning=FALSE}
+datasets_overview <-
+  coefficients_summary %>%
+  group_by(dataset_id) %>%
+  summarise(
+    max_cv = max(cv, na.rm = T),
+    high_cv = any(cv > 1e-10, na.rm = T),
+    perc_coefficients_missing = sum(total_missing) / sum(total_coefficients_fit),
+    .groups = "drop"
+  ) %>%
+  left_join(datasets_processed %>%
+              bind_rows() %>%
+              select(dataset_id, dep_var, n_obs, n_cols),
+            by = "dataset_id")
+
+datasets_summary <-
+  datasets_overview %>%
+  summarise(perc_high_cv = mean(high_cv),
+            total_high_cv = sum(high_cv))
+datasets_summary
+```
+
+On the dataset level we can see that `r datasets_summary$total_high_cv` out of
+`r length(datasets_processed)` (`r round(datasets_summary$perc_high_cv*100,1)` %) 
+datasets show coefficient fluctuations.
+
+```{r problematic_datasets2, rows.print = 20}
+datasets_overview %>% 
+  filter(high_cv)
+
+```
+
+# Underdetermined Problems
+
+The first thing we notice is that three of the datasets have less observations
+than predictors in the model, i.e. the problem is underdetermined. This is also
+reflected in the missing coefficients (column `perc_coefficients_missing`):
+
+```{r underdetermined_datasets, rows.print = 20}
+datasets_overview %>%
+  filter(high_cv, n_obs < n_cols)
+```
+
+Note that while `n_cols` counts all the columns (target variable and predictors)
+in the dataset it still happens to be equal to the number of coefficients we
+want to estimate since we are fitting a model with an intercept.
+
+For a more detailed analysis let's add the rank of the QR decomposition for each
+model fit.
+
+```{r add_qr_decomp_rank, rows.print = 20}
+results_lm$rank_qr <-
+  lapply(results_lm$model_fit,
+         function(x) {
+           x$qr$rank
+         }) %>% unlist
+
+# check if rank of QR decomp is invariant under column permutations so we can
+# safely append to dataset overview
+if (nrow(results_lm %>% distinct(dataset_id, rank_qr)) !=
+    nrow(results_lm %>% distinct(dataset_id))) {
+  stop("QR decomposition rank not invariant under predictor permutations.")
+}
+
+ranks_qr <-
+  results_lm %>%
+  distinct(dataset_id,
+           rank_qr)
+
+datasets_overview %<>%
+  left_join(ranks_qr,
+            by = "dataset_id") %>%
+  mutate(singular_qr = rank_qr < n_cols)
+datasets_overview %>%
+  filter(high_cv)
+```
+
+We can see that with the exception of two datasets all the datasets with high 
+coefficient fluctuations are showing a singular QR decomposition.
+
+# Multicollinearity
+
+We now focus on the problematic datasets which are not underdetermined and will 
+investigate what is causing the singular QR decomposition:
+
+```{r problematic_datasets3, rows.print = 20}
+datasets_overview %>%
+  filter(high_cv, singular_qr, n_obs > n_cols)
+```
+
+As we will show below each of the datasets in the list above contains 
+multicollinearity in the predictors.
+
+## Dataset 195
+
+There is collinearity in the dummy columns belonging to the `symboling` variable.
+If you were to simply apply a one hot encoding without any other precautions you
+will get collinearity in the resulting dummy columns. In our dummification code
+we therefore remove the set the flag `remove_first_dummy` of the `dummy_cols` 
+function to `TRUE` which will remove the dummy column corresponding to the first
+level in the data. However, this approach fails here since the `symboling` 
+variable is supposed to have 7 levels (`-3`, `-2`, `-1`, `0`, `1`, `2`, `3`) but
+only the last six levels are ever encountered in the data. Therefore the approach
+to remove collinearity from the dummy columns fails in this case and we get
+collinearity between the dummy columns.
+
+```{r dataset_195}
+current_ds_id <-
+  "195"
+current_ds <- datasets_raw[[current_ds_id]]$data
+current_ds_processed <- datasets_processed[[current_ds_id]]$data[[1]]
+all((1-(current_ds_processed$`symboling_-2` + current_ds_processed$`symboling_-1`  + current_ds_processed$`symboling_0` + current_ds_processed$`symboling_1` + current_ds_processed$`symboling_2`)) == (current_ds_processed$`symboling_3`))
+```
+
+## Datasets 482, 513, 533, 536
+
+Those datasets seem to be variants of the same dataset which all have the same collinearity pattern. The `conc` variable has a unique value within each level
+of `group`. Therefore after dummification `conc` can be represented as the 
+weighted sum of the `group` columns where the weights are the values of `conc` 
+within that group. See code below.
+
+
+```{r dataset_482}
+current_ds_id <-
+  "482"
+current_ds <- datasets_raw[[current_ds_id]]$data
+current_ds_processed <-
+  datasets_processed[[current_ds_id]]$data[[1]]
+weights <-
+  current_ds %>% distinct(group, conc) %>% pull(conc)
+weights <-
+  weights[2:length(weights)]
+
+all(
+  apply(
+    current_ds_processed %>% select(matches("^group")) * matrix(
+      rep(weights, nrow(current_ds_processed)),
+      nrow = nrow(current_ds_processed),
+      byrow = T
+    ),
+    FUN = sum,
+    MARGIN = 1
+  ) == current_ds_processed$conc
+)
+```
+
+## Dataset 518
+
+The variable `Injuries` is the sum of `Good.neutral_injuries` and `Bad_injuries`
+(same applies for `Fatalities`).
+
+```{r dataset_518}
+current_ds_id <-
+  "518"
+current_ds <- datasets_raw[[current_ds_id]]$data
+current_ds_processed <-
+  datasets_processed[[current_ds_id]]$data
+all(all((current_ds$Good.neutral_injuries + current_ds$Bad_injuries) == current_ds$Injuries))
+```
+
+## Dataset 521
+
+The predictors `Seed_team_1`, `Seed_team_2` and the `X*`s are collinear:
+
+```{r ds_521}
+current_ds_id <-
+  "521"
+current_ds <- datasets_raw[[current_ds_id]]$data %>%
+  mutate_all(.funs = list( ~ as.numeric(as.character(.))))
+current_ds %<>%
+  mutate(
+    Seed_team_2_comb = (
+      Seed_team_1 - X2 - 2 * X3 - 3 * X4 - 4 * X5 - 5 * X6 - 6 * X7 -
+        7 * X8 - 8 * X9 - 9 * X10 - 10 * X11 - 11 *
+        X12 - 12 * X13 -
+        13 * X14 - 14 * X15 - 15 * X16
+    )
+  )
+all(current_ds$Seed_team_2 == current_ds$Seed_team_2_comb)
+```
+
+## Dataset 530
+
+Variable `Total2000` is the sum of `Gold2000`, `Silver2000` and `Bronze2000`:
+
+```{r ds_530}
+current_ds_id <- "530"
+current_ds <- datasets_raw[[current_ds_id]]$data
+all((current_ds$Gold2000 + current_ds$Silver2000 + current_ds$Bronze2000) == (current_ds$Total2000))
+```
+
+## Dataset 543
+
+The values in `TOWN_ID` and `TOWN` have a 1-to-1 relationship. Therefore after 
+the dummification `TOWN_ID` can be represented as the weighted sum over all
+`TOWN` dummy columns where the weights for each `TOWN` column is the value of the
+corresponding `TOWN_ID`.
+
+```{r ds_543, rows.print = 20}
+current_ds_id <- "543"
+current_ds <- datasets_raw[[current_ds_id]]$data
+current_ds %>% distinct(TOWN, TOWN_ID)
+```
+
+## Dataset 551
+
+The dataset contains factor variabls for `Season` and `Month`. Therefore after 
+dummification the Season variables can be rewritten as a sum of a subset of the
+month variables (and vice versa).
+
+```{r ds_551, rows.print = 20}
+current_ds_id <- "551"
+current_ds_processed <- datasets_processed[[current_ds_id]]$data[[1]]
+all(current_ds_processed$Season_Summer == (current_ds_processed$Month_June + current_ds_processed$Month_July + current_ds_processed$Month_August))
+```
+
+## Dataset 1051
+
+In this dataset it's somewhat tricky to spot the collinearity pattern as it can
+not be derived from the meaning of the variables. It seems to have only occured
+randomly due to the high number of categorical variables relative to the amount
+of observations.
+
+```{r ds_1051, rows.print = 20}
+current_ds_id <- "1051"
+current_ds <- datasets_raw[[current_ds_id]]$data
+current_ds_processed <- datasets_processed[[current_ds_id]]$data[[1]]
+all(current_ds_processed$MODP_Very_High == (current_ds_processed$STOR_Very_High - current_ds_processed$RELY_Very_High + current_ds_processed$CPLX_Extra_High))
+```
+
+# Remaining Datasets
+
+For the remaining datasets with coefficient fluctuations we were able to spot
+collinearity between the _target variable_ and some of the predictors. This is
+obviously not a reasonable setting to run regression in but it shows nicely how
+`lm` handles this case. 
+
+Since $X^tX$ is not rank deficient the QR decomposition algorithm does not hit its stopping criterion and therefore does not return `NA`s. Instead it returns values 
+close to zeros (on the order of $10^{-16}$) for some of the coefficients in each fit.
+
+This probably makes sense as multiple regression can be interpreted as fitting a
+sequence of univariate regressions in which each member of the sequence fits against the residual of its predecessor (see Elements of Statistical Learning Section 3.2.3).
+
+That means after all the predictors which are involved in the collinearity with
+the target variable have been fit the residual will become zero (or very close
+to zero) and all remaining coefficients will be set so accordingly.
+
+## Dataset 527
+
+The `Total00` is the sum of a subset of the predictors and the target variable.
+
+```{r ds_527, rows.print = 20}
+current_ds_id <- "527"
+current_ds <- datasets_raw[[current_ds_id]]$data
+current_ds_processed <-
+  datasets_processed[[current_ds_id]]$data[[1]]
+all((
+  datasets_processed[[current_ds_id]]$data[[1]]$Total00 - apply(
+    datasets_processed[[current_ds_id]]$data[[1]] %>% select(Bush00:Phillips00),
+    MARGIN = 1,
+    sum
+  )
+) == datasets_processed[[current_ds_id]]$data[[1]]$Gore00)
+```
+
+## Dataset 1091
+
+The target variable `NOx` is included under a different name (`NOxPot`) as a 
+predictor.
+
+```{r ds_1091, rows.print = 20}
+current_ds_id <- "1091"
+current_ds <- datasets_raw[[current_ds_id]]$data
+current_ds_processed <-
+  datasets_processed[[current_ds_id]]$data[[1]]
+all(current_ds_processed$NOx == current_ds_processed$NOxPot)
+```
+
+# Pivoting in Fortran
+
+As one final thing we check whether the pivoting that Fortran applies internally
+to improve the numerical stability of the QR decomposition may have affected
+some of our results. Luckily they did not:
+
+```{r pivoting_fortran, rows.print = 25}
+results_lm$pivoting_applied <-
+  lapply(results_lm$model_fit, function(x) {
+    !all(x$qr$pivot == 1:length(x$qr$pivot))
+  }) %>% unlist
+
+
+datasets_overview %<>%
+  left_join(results_lm %>% 
+              group_by(dataset_id) %>% 
+              summarise(pivoting_applied = any(pivoting_applied)),
+            by = "dataset_id")
+
+datasets_overview %>% filter(pivoting_applied)
+
+```
+
